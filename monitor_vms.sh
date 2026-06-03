@@ -10,7 +10,7 @@ fi
 
 # REQUIRED: Enter host node name and VM IDs to monitor.
 HOST_NODE="pve"
-MONITOR_VMS=("101" "102" "103" "104)
+MONITOR_VMS=("101" "102" "103" "104")
 
 LOG_FILE="/var/log/vm_monitor.log"
 
