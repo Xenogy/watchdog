@@ -1,15 +1,6 @@
 # watchdog
 
-A simple **Proxmox VE** watchdog for virtual machines. It runs on your Proxmox
-host and, every few minutes, checks each VM you tell it to watch. If a VM has
-crashed (stopped), is pinned at very high CPU, or has stalled at very low CPU,
-the watchdog automatically restarts it.
-
-It is a single Bash script (`monitor_vms.sh`) that you schedule with `cron`.
-
-> ⚠️ **This script restarts and force-stops VMs.** Only list the VM IDs that are
-> safe to reboot automatically, and run it once by hand (see *Test it*) before
-> you schedule it.
+A single Bash script (`monitor_vms.sh`) that you schedule with `cron`.
 
 ## Requirements
 
@@ -23,9 +14,6 @@ It is a single Bash script (`monitor_vms.sh`) that you schedule with `cron`.
 
 ## Install
 
-Pick **one** of the two options below. Both leave the script at
-`/root/monitor_vms.sh`, which is the path the cron job will use.
-
 ### Option A — Clone the git repository
 
 ```bash
@@ -33,8 +21,6 @@ cd /root
 git clone https://github.com/Xenogy/watchdog.git
 cp /root/watchdog/monitor_vms.sh /root/monitor_vms.sh
 ```
-
-(If `git` is not installed, run `apt install -y git` first.)
 
 ### Option B — Paste the script with nano
 
@@ -44,9 +30,8 @@ cp /root/watchdog/monitor_vms.sh /root/monitor_vms.sh
    nano /root/monitor_vms.sh
    ```
 
-2. Paste in the full contents of `monitor_vms.sh` (copy it from the file on the
-   GitHub repo page).
-3. Save and exit: press **Ctrl+O**, then **Enter**, then **Ctrl+X**.
+2. Paste in the full contents of `monitor_vms.sh`
+3. Save and exit: press **Ctrl+S**, then **Ctrl+X**.
 
 ## Configure (required)
 
@@ -68,7 +53,7 @@ MONITOR_VMS=("101" "102" "103" "104")    # the VM IDs to watch
   each ID in its own pair of quotes**, exactly as shown above (an unmatched
   quote will break the whole script).
 
-Save and exit again (**Ctrl+O**, **Enter**, **Ctrl+X**).
+Save and exit again (**Ctrl+S**, **Ctrl+X**).
 
 ## Make it executable
 
@@ -84,11 +69,9 @@ Run it once by hand before scheduling it:
 /root/monitor_vms.sh
 ```
 
-You should see lines such as `Checking VM: 101` and `VM 101 healthy`. If you get
-a `syntax error`, re-check the `MONITOR_VMS` line — every ID needs both an
-opening and a closing quote.
+You should see lines such as `Checking VM: 101` and `VM 101 healthy`.
 
-## Schedule it with cron (every 15 minutes)
+## Schedule it with cron
 
 1. Open root's crontab:
 
@@ -104,7 +87,7 @@ opening and a closing quote.
    */15 * * * * /root/monitor_vms.sh
    ```
 
-3. Save and exit (**Ctrl+O**, **Enter**, **Ctrl+X**).
+3. Save and exit (**Ctrl+S**, **Ctrl+X**).
 
 `*/15 * * * *` means *run at every 15th minute* — i.e. at :00, :15, :30, and :45
 past every hour. The five fields are **minute, hour, day-of-month, month,
