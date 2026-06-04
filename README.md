@@ -14,7 +14,7 @@ A single Bash script (`monitor_vms.sh`) that you schedule with `cron`.
 
 ## Install
 
-### Option A — Clone the git repository
+### Clone the git repository
 
 ```bash
 cd /root
