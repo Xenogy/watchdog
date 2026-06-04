@@ -19,26 +19,14 @@ A single Bash script (`monitor_vms.sh`) that you schedule with `cron`.
 ```bash
 cd /root
 git clone https://github.com/Xenogy/watchdog.git
-cp /root/watchdog/monitor_vms.sh /root/monitor_vms.sh
 ```
-
-### Option B — Paste the script with nano
-
-1. Open a new, empty file:
-
-   ```bash
-   nano /root/monitor_vms.sh
-   ```
-
-2. Paste in the full contents of `monitor_vms.sh`
-3. Save and exit: press **Ctrl+S**, then **Ctrl+X**.
 
 ## Configure (required)
 
 Open the script and edit the two settings near the top:
 
 ```bash
-nano /root/monitor_vms.sh
+nano /root/watchdog/monitor_vms.sh
 ```
 
 ```bash
@@ -58,7 +46,7 @@ Save and exit again (**Ctrl+S**, **Ctrl+X**).
 ## Make it executable
 
 ```bash
-chmod +x /root/monitor_vms.sh
+chmod +x /root/watchdog/monitor_vms.sh
 ```
 
 ## Test it
@@ -66,7 +54,7 @@ chmod +x /root/monitor_vms.sh
 Run it once by hand before scheduling it:
 
 ```bash
-/root/monitor_vms.sh
+/root/watchdog/monitor_vms.sh
 ```
 
 You should see lines such as `Checking VM: 101` and `VM 101 healthy`.
@@ -84,7 +72,7 @@ You should see lines such as `Checking VM: 101` and `VM 101 healthy`.
 2. Add this line at the bottom of the file:
 
    ```
-   */15 * * * * /root/monitor_vms.sh
+   */15 * * * * /root/watchdog/monitor_vms.sh
    ```
 
 3. Save and exit (**Ctrl+S**, **Ctrl+X**).
