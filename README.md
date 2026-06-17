@@ -23,25 +23,62 @@ git clone https://github.com/Xenogy/watchdog.git
 
 ## Configure (required)
 
-Open the script and edit the two settings near the top:
+Open the script and set your node name near the top:
 
 ```bash
 nano /root/watchdog/monitor_vms.sh
 ```
 
 ```bash
-# REQUIRED: Enter host node name and VM IDs to monitor.
-HOST_NODE="pve"                          # your Proxmox node name
-MONITOR_VMS=("101" "102" "103" "104")    # the VM IDs to watch
+# REQUIRED: Enter the Proxmox host node name (find it with `hostname`).
+HOST_NODE="pve"
+
+WATCHDOG_TAG="watchdog"
 ```
 
 - **`HOST_NODE`** — your node's name. Find it with `hostname`, or read it from
   the left sidebar of the Proxmox web interface.
-- **`MONITOR_VMS`** — the list of VM IDs to watch, separated by spaces. **Wrap
-  each ID in its own pair of quotes**, exactly as shown above (an unmatched
-  quote will break the whole script).
+- **`WATCHDOG_TAG`** — the tag that marks a VM for monitoring. The default,
+  `watchdog`, matches the rest of this guide; leave it unless you want a
+  different name.
 
 Save and exit again (**Ctrl+S**, **Ctrl+X**).
+
+## Choose which VMs to monitor (by tag)
+
+You no longer list VM IDs in the script. Instead, **tag the VMs you want
+watched** with the `watchdog` tag — every VM carrying that tag is monitored,
+and the script re-reads the tags on every run.
+
+In the **Proxmox web interface**: open the VM → its **Summary** page → click the
+**＋** next to the VM name (or **Edit** in the Notes/Tags area) → type
+`watchdog` → confirm.
+
+Or from the **command line**. For a VM that has no other tags:
+
+```bash
+qm set 101 --tags watchdog
+```
+
+`qm set --tags` **replaces** the VM's entire tag list, so if the VM already has
+tags you must list them all (semicolon-separated), e.g.:
+
+```bash
+qm set 101 --tags "production;web;watchdog"
+```
+
+To **temporarily disable** monitoring for a VM — handy during testing — just
+remove the `watchdog` tag again (UI, or re-run `qm set` with the remaining tags;
+`qm set <vmid> --tags ""` clears all tags). The change takes effect on the next
+run. The script also re-checks each VM's tags immediately before acting on it,
+so a tag removed mid-run is honored before the next restart attempt — though it
+won't interrupt a `qm` stop/start already in progress.
+
+Notes:
+
+- Matching is **case-insensitive** (`watchdog`, `Watchdog`, … all count) and
+  matches the whole tag, so unrelated tags like `watchdog-test` are ignored.
+- **Templates are skipped** automatically, even if tagged.
 
 ## Make it executable
 
@@ -57,7 +94,10 @@ Run it once by hand before scheduling it:
 /root/watchdog/monitor_vms.sh
 ```
 
-You should see lines such as `Checking VM: 101` and `VM 101 healthy`.
+You should see a line listing the tagged VMs it found (e.g.
+`Monitoring 2 VM(s) tagged 'watchdog': 101 104`), followed by lines such as
+`Checking VM: 101` and `VM 101 healthy`. If you haven't tagged any VMs yet, it
+logs `No VMs tagged 'watchdog'` and exits — go back and add the tag.
 
 ## Schedule it with cron
 
