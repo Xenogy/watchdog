@@ -78,6 +78,11 @@ WATCHDOG_VMS=()
 # LOCAL_NODE.
 declare -A VM_NODE=()
 
+# Maps each cluster node name to its IP (from /etc/pve/.members), so remote SSH
+# targets the IP directly rather than the bare node name -- which often does not
+# resolve via DNS/hosts. Only populated in cluster-wide mode.
+declare -A NODE_IP=()
+
 log() {
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
@@ -95,6 +100,42 @@ detect_local_node() {
         fi
 
         hostname -s 2>/dev/null || hostname 2>/dev/null || true
+}
+
+# Populate NODE_IP (node name -> IP) from Proxmox's cluster membership file, so
+# remote SSH can target a node's IP directly. This sidesteps clusters where the
+# bare node name does not resolve via DNS/hosts (the common case). Best-effort:
+# if the data is missing, run_on_vm_node falls back to the node name.
+load_node_ips() {
+        local members="/etc/pve/.members"
+        local name=""
+        local ip=""
+
+        NODE_IP=()
+
+        if [[ ! -r "$members" ]]; then
+                return 0
+        fi
+
+        while IFS=$'\t' read -r name ip; do
+                if [[ -n "$name" && -n "$ip" ]]; then
+                        NODE_IP["$name"]="$ip"
+                fi
+        done < <(/usr/bin/jq -r '.nodelist // {} | to_entries[] | "\(.key)\t\(.value.ip // "")"' "$members" 2>/dev/null)
+
+        return 0
+}
+
+# Render the resolved node->IP map for logging (e.g. "m1=10.0.0.2 gpu1=10.0.0.1").
+format_node_ips() {
+        local name=""
+        local out=""
+
+        for name in "${!NODE_IP[@]}"; do
+                out+="${name}=${NODE_IP[$name]} "
+        done
+
+        printf '%s' "${out% }"
 }
 
 acquire_lock() {
@@ -161,6 +202,9 @@ run_on_vm_node() {
         shift 2
 
         if [[ -n "$node" && "$node" != "$LOCAL_NODE" ]]; then
+                # Prefer the node's IP (node names often don't resolve via
+                # DNS/hosts); fall back to the name if no IP was discovered.
+                local target="${NODE_IP[$node]:-$node}"
                 # -n points ssh's stdin at /dev/null. Without it ssh inherits and
                 # drains the stdin of an enclosing `while read` loop (e.g.
                 # is_vm_lock_stuck_in_d_state iterating lock-holder PIDs), which
@@ -170,7 +214,7 @@ run_on_vm_node() {
                         -o ConnectTimeout="$SSH_CONNECT_TIMEOUT_SECONDS" \
                         -o StrictHostKeyChecking=accept-new \
                         -o LogLevel=ERROR \
-                        "root@$node" "$@"
+                        "root@$target" "$@"
         else
                 run_with_timeout "$timeout_seconds" "$@"
         fi
@@ -849,6 +893,12 @@ fi
 
 if [[ "$CLUSTER_WIDE" == "1" ]]; then
         log "Running on node '$LOCAL_NODE' (cluster-wide mode)."
+        load_node_ips
+        if (( ${#NODE_IP[@]} > 0 )); then
+                log "Resolved node IPs for SSH: $(format_node_ips)"
+        else
+                log "No node IPs found in /etc/pve/.members; SSH will use bare node names (may fail if they don't resolve)."
+        fi
 else
         log "Running on node '$LOCAL_NODE' (node-local mode)."
 fi

@@ -105,10 +105,13 @@ down, VMs on unreachable nodes are simply skipped that cycle (logged).
 Requirements and notes:
 
 - **Inter-node root SSH must work.** Proxmox sets up passwordless `root` SSH
-  between cluster members by default, so this normally works out of the box. You
-  can confirm with `ssh root@<other-node> qm list` from the node running the
-  watchdog. If your cluster has locked that down, the watchdog will fall back to
-  simply skipping VMs it can't reach (logged), so nothing is silently broken.
+  between cluster members by default, so this normally works out of the box. The
+  watchdog connects to each node by its **IP** (read from `/etc/pve/.members`),
+  so node names do **not** need to resolve via DNS/`/etc/hosts`. You can confirm
+  reachability with `ssh root@<other-node-IP> qm list` from the node running the
+  watchdog. If SSH is locked down, the watchdog falls back to skipping VMs it
+  can't reach (logged), so nothing is silently broken. The startup log prints the
+  node→IP map it resolved.
 - **The node you run on is auto-detected** (from `/etc/pve/local`) — that's how
   the script tells "local" from "remote", so there's nothing to configure.
 - **`lsof` must be installed on every node** (lock inspection runs on the VM's
