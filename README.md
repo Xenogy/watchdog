@@ -34,6 +34,7 @@ nano /root/watchdog/monitor_vms.sh
 WATCHDOG_TAG="watchdog"
 
 WATCHDOG_ACTIVE_TAG="watchdog-active"
+TAG_DURING_CHECK=1
 
 CLUSTER_WIDE=0
 ```
@@ -41,10 +42,15 @@ CLUSTER_WIDE=0
 - **`WATCHDOG_TAG`** — the tag that marks a VM for monitoring. The default,
   `watchdog`, matches the rest of this guide; leave it unless you want a
   different name.
-- **`WATCHDOG_ACTIVE_TAG`** — a transient tag the watchdog adds to a VM while it
-  is restarting it, then removes when the restart finishes (see
+- **`WATCHDOG_ACTIVE_TAG`** — a transient tag the watchdog puts on a VM while it
+  is working on it, then removes when it is done (see
   [The "active" tag](#the-active-tag) below). Set it to `""` to turn the feature
   off.
+- **`TAG_DURING_CHECK`** — when `1` (default), the active tag is applied while
+  the watchdog is merely *examining* each VM, so it visibly steps from one VM to
+  the next and you can watch a run progress in the UI. Set to `0` to tag a VM
+  only while it is actually being restarted (see
+  [The "active" tag](#the-active-tag)).
 - **`CLUSTER_WIDE`** — leave at `0` to watch only this node's VMs. Set to `1` to
   watch tagged VMs across the whole cluster from this one node (see
   [Cluster-wide mode](#cluster-wide-mode-optional) below).
@@ -93,34 +99,59 @@ Notes:
 
 ## The "active" tag
 
-While the watchdog is actually restarting a VM, it tags that VM with
-`watchdog-active` (configurable via `WATCHDOG_ACTIVE_TAG`) and removes the tag as
-soon as the restart finishes — whether it succeeded, failed, or was aborted
-because the `watchdog` tag was pulled mid-run. The VM's other tags are left
-untouched.
+While the watchdog is working on a VM it tags that VM with `watchdog-active`
+(configurable via `WATCHDOG_ACTIVE_TAG`) and removes the tag again when it is
+done. The VM's other tags are left untouched.
 
 This gives you two things:
 
-- **Visibility** — a VM currently being recovered is obvious at a glance in the
-  Proxmox UI and in `qm config`/`pvesh` output.
+- **Visibility** — the VM the watchdog is touching right now is obvious at a
+  glance in the Proxmox UI and in `qm config`/`pvesh` output.
 - **Coordination** — other automation can watch for this tag and hold off on
-  touching a VM until it disappears, so nothing fights the watchdog while it is
-  stopping/starting a guest.
+  touching a VM until it disappears, so nothing fights the watchdog.
 
-So the lifecycle of a healthy, watched VM is: it carries `watchdog`; if the
-watchdog ever has to restart it, `watchdog-active` appears for the duration of
-the restart and then goes away again.
+### What "working on it" means: `TAG_DURING_CHECK`
 
-A couple of details:
+The watchdog walks its monitored VMs one at a time. `TAG_DURING_CHECK` controls
+how much of that work the tag covers:
 
-- The tag is added only when a restart is genuinely attempted — not when a VM is
-  skipped (e.g. still in its restart cooldown, or its lock holder is stuck).
+- **`TAG_DURING_CHECK=1` (default)** — the tag is added as each VM's check
+  *begins* and removed as it *ends*, so the tag visibly steps from one VM to the
+  next and you can follow a run's progress live in the UI. If a check decides to
+  restart the VM, the tag simply stays on through the restart and comes off when
+  that finishes. So normally only one VM is tagged at a time during the
+  sequential check; the exceptions are if you also enable parallel restarts, or
+  if a tag removal fails (a transient `pvesh` error leaves it lingering until the
+  next run's startup sweep — see [Details](#details)).
+- **`TAG_DURING_CHECK=0`** — the tag is applied *only* while a VM is actually
+  being restarted. Its presence then strictly means "the watchdog is changing
+  this VM," which is the cleaner do-not-touch signal for other automation, and it
+  avoids a tag write per VM on every run (worth considering if you monitor many
+  VMs and want to keep cluster-config churn down). The visual progress cursor is
+  lost.
+
+Either way, the lifecycle of a healthy watched VM is: it carries `watchdog`; the
+`watchdog-active` tag appears while the watchdog is on it and then goes away
+again.
+
+### Details
+
+- During a restart the tag is removed whether it **succeeded, failed, or was
+  aborted** because the `watchdog` tag was pulled mid-run.
+- A *restart* never tags a VM the watchdog decided to **skip** (e.g. still in its
+  restart cooldown, or its lock holder is stuck in `D` state). With
+  `TAG_DURING_CHECK=1` such a VM is still briefly tagged for its check, then
+  untagged like any other examined VM.
 - If a run is **killed mid-restart** (host reboot, `kill -9`, …) the tag can be
   left behind. To prevent it from lingering forever, the watchdog strips any
   pre-existing `watchdog-active` from monitored VMs at the **start** of each run,
   before it begins any work — safe because only one run executes at a time.
+- The tag is a best-effort, soft signal, **not a lock.** There is a small window
+  between another system reading tags and the watchdog adding the tag, and the
+  tag doesn't prevent anyone from acting. The real guard during `qm`
+  stop/start/unlock remains Proxmox's own per-VM config lock.
 - Set `WATCHDOG_ACTIVE_TAG=""` to disable the feature entirely (no tag is ever
-  added, and the startup cleanup is skipped).
+  added, the check-time tagging and the startup cleanup are both skipped).
 
 ## Cluster-wide mode (optional)
 
