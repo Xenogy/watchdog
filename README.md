@@ -21,31 +21,31 @@ cd /root
 git clone https://github.com/Xenogy/watchdog.git
 ```
 
-## Configure (required)
+## Configure (optional)
 
-Open the script and set your node name near the top:
+There's nothing you *have* to set — the script auto-detects which node it's
+running on. The two settings you might want to change live near the top:
 
 ```bash
 nano /root/watchdog/monitor_vms.sh
 ```
 
 ```bash
-# REQUIRED: Enter the Proxmox host node name (find it with `hostname`).
-HOST_NODE="pve"
-
 WATCHDOG_TAG="watchdog"
 
 CLUSTER_WIDE=0
 ```
 
-- **`HOST_NODE`** — your node's name. Find it with `hostname`, or read it from
-  the left sidebar of the Proxmox web interface.
 - **`WATCHDOG_TAG`** — the tag that marks a VM for monitoring. The default,
   `watchdog`, matches the rest of this guide; leave it unless you want a
   different name.
 - **`CLUSTER_WIDE`** — leave at `0` to watch only this node's VMs. Set to `1` to
   watch tagged VMs across the whole cluster from this one node (see
   [Cluster-wide mode](#cluster-wide-mode-optional) below).
+
+There's also a `LOCAL_NODE` setting just above these, normally left **empty** —
+the script detects this node's name from Proxmox. Only set it if auto-detection
+ever picks the wrong name.
 
 Save and exit again (**Ctrl+S**, **Ctrl+X**).
 
@@ -109,8 +109,8 @@ Requirements and notes:
   can confirm with `ssh root@<other-node> qm list` from the node running the
   watchdog. If your cluster has locked that down, the watchdog will fall back to
   simply skipping VMs it can't reach (logged), so nothing is silently broken.
-- **`HOST_NODE` must still name the node you run it on** — it's how the script
-  tells "local" from "remote".
+- **The node you run on is auto-detected** (from `/etc/pve/local`) — that's how
+  the script tells "local" from "remote", so there's nothing to configure.
 - **`lsof` must be installed on every node** (lock inspection runs on the VM's
   host node). `jq` is only needed on the node running the watchdog.
 - **Run it on one node only.** Don't also leave per-node copies running, or
