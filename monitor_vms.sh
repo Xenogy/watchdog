@@ -8,8 +8,10 @@ if [[ "${VM_MONITOR_SKIP_REDIRECT:-0}" != "1" ]]; then
         exec > >(tee -a "$CRON_LOG_FILE") 2>&1
 fi
 
-# REQUIRED: Enter the Proxmox host node name (find it with `hostname`).
-HOST_NODE="pve"
+# The name of THIS node (the one running the script) is auto-detected from
+# Proxmox, so you normally do not need to set anything here. Only fill this in
+# to override auto-detection if it ever picks the wrong name.
+LOCAL_NODE=""
 
 # VMs to monitor are selected dynamically by tag: every VM carrying this tag is
 # watched. Add or remove the tag in the Proxmox UI (or with
@@ -18,12 +20,12 @@ HOST_NODE="pve"
 WATCHDOG_TAG="watchdog"
 
 # Optional cluster-wide mode.
-#   0 (default) - only manage VMs on HOST_NODE, using local commands exactly as
+#   0 (default) - only manage VMs on LOCAL_NODE, using local commands exactly as
 #                 before.
 #   1           - discover tagged VMs across the whole cluster and manage VMs on
 #                 other nodes over SSH. Run the watchdog from a single node.
 # Proxmox configures passwordless root SSH between cluster nodes by default, so
-# no extra setup is normally needed. HOST_NODE must still name THIS node.
+# no extra setup is normally needed.
 CLUSTER_WIDE=0
 SSH_CONNECT_TIMEOUT_SECONDS=10
 
@@ -73,11 +75,26 @@ WATCHDOG_VMS=()
 
 # Maps each monitored VM id to the cluster node that hosts it. Only populated in
 # cluster-wide mode; node-local mode leaves it empty so every lookup defaults to
-# HOST_NODE.
+# LOCAL_NODE.
 declare -A VM_NODE=()
 
 log() {
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+# Determine the name of the node this script is running on. Proxmox exposes it
+# as the symlink /etc/pve/local -> nodes/<thisnode>; fall back to the system
+# hostname if that is unavailable. Prints the node name (empty on failure).
+detect_local_node() {
+        local target=""
+
+        target=$(readlink -f /etc/pve/local 2>/dev/null)
+        if [[ -n "$target" ]]; then
+                printf '%s' "${target##*/}"
+                return 0
+        fi
+
+        hostname -s 2>/dev/null || hostname 2>/dev/null || true
 }
 
 acquire_lock() {
@@ -143,7 +160,7 @@ run_on_vm_node() {
         local timeout_seconds="$2"
         shift 2
 
-        if [[ -n "$node" && "$node" != "$HOST_NODE" ]]; then
+        if [[ -n "$node" && "$node" != "$LOCAL_NODE" ]]; then
                 # -n points ssh's stdin at /dev/null. Without it ssh inherits and
                 # drains the stdin of an enclosing `while read` loop (e.g.
                 # is_vm_lock_stuck_in_d_state iterating lock-holder PIDs), which
@@ -179,7 +196,7 @@ is_monitored_vm() {
 # abandon a VM precisely when the node is too busy to answer quickly.
 get_vm_tags() {
         local vm_id="$1"
-        local node="${VM_NODE[$vm_id]:-$HOST_NODE}"
+        local node="${VM_NODE[$vm_id]:-$LOCAL_NODE}"
         local raw=""
         local rc=0
 
@@ -258,7 +275,7 @@ discover_watchdog_vms() {
         return $?
 }
 
-# Node-local discovery: enumerate the VMs on HOST_NODE and keep the tagged ones.
+# Node-local discovery: enumerate the VMs on LOCAL_NODE and keep the tagged ones.
 # A per-VM tag read that fails is logged and that VM is left out for this cycle
 # (reconsidered next run) rather than being silently dropped or restarted while
 # its tag state is unknown.
@@ -269,10 +286,10 @@ discover_watchdog_vms_node() {
         local tags=""
         local rc=0
 
-        index_json=$(run_with_timeout "$PVESH_CMD_TIMEOUT_SECONDS" /usr/bin/pvesh get "/nodes/$HOST_NODE/qemu" --output-format json 2>/dev/null)
+        index_json=$(run_with_timeout "$PVESH_CMD_TIMEOUT_SECONDS" /usr/bin/pvesh get "/nodes/$LOCAL_NODE/qemu" --output-format json 2>/dev/null)
 
         if [[ -z "$index_json" ]] || ! echo "$index_json" | /usr/bin/jq -e 'type == "array"' >/dev/null 2>&1; then
-                log "Unable to enumerate VMs on node '$HOST_NODE' (pvesh failed or returned no data). Skipping this cycle."
+                log "Unable to enumerate VMs on node '$LOCAL_NODE' (pvesh failed or returned no data). Skipping this cycle."
                 return 1
         fi
 
@@ -344,13 +361,13 @@ discover_watchdog_vms_cluster() {
 
 # Render the monitored VM list for logging. In cluster mode each entry shows the
 # hosting node (e.g. "101@pve1"); in node-local mode VM_NODE is empty so it
-# falls back to HOST_NODE.
+# falls back to LOCAL_NODE.
 format_watchdog_vms() {
         local vm_id=""
         local out=""
 
         for vm_id in "${WATCHDOG_VMS[@]}"; do
-                out+="${vm_id}@${VM_NODE[$vm_id]:-$HOST_NODE} "
+                out+="${vm_id}@${VM_NODE[$vm_id]:-$LOCAL_NODE} "
         done
 
         printf '%s' "${out% }"
@@ -398,7 +415,7 @@ cleanup_stale_qm_processes() {
 
 is_vm_lock_held() {
         local vm_id="$1"
-        local node="${VM_NODE[$vm_id]:-$HOST_NODE}"
+        local node="${VM_NODE[$vm_id]:-$LOCAL_NODE}"
         local lock_file="/var/lock/qemu-server/lock-${vm_id}.conf"
         local holder_count=0
 
@@ -412,7 +429,7 @@ is_vm_lock_held() {
 
 get_vm_lock_holders() {
         local vm_id="$1"
-        local node="${VM_NODE[$vm_id]:-$HOST_NODE}"
+        local node="${VM_NODE[$vm_id]:-$LOCAL_NODE}"
         local lock_file="/var/lock/qemu-server/lock-${vm_id}.conf"
 
         run_on_vm_node "$node" "$VM_LOCK_CHECK_TIMEOUT_SECONDS" /usr/bin/lsof "$lock_file" 2>/dev/null | awk 'NR>1 {printf "%s(pid=%s) ", $1, $2}'
@@ -420,7 +437,7 @@ get_vm_lock_holders() {
 
 get_vm_lock_holder_pids() {
         local vm_id="$1"
-        local node="${VM_NODE[$vm_id]:-$HOST_NODE}"
+        local node="${VM_NODE[$vm_id]:-$LOCAL_NODE}"
         local lock_file="/var/lock/qemu-server/lock-${vm_id}.conf"
 
         run_on_vm_node "$node" "$VM_LOCK_CHECK_TIMEOUT_SECONDS" /usr/bin/lsof "$lock_file" 2>/dev/null | awk 'NR>1 {print $2}' | sort -u
@@ -435,7 +452,7 @@ get_process_state() {
 
 is_vm_lock_stuck_in_d_state() {
         local vm_id="$1"
-        local node="${VM_NODE[$vm_id]:-$HOST_NODE}"
+        local node="${VM_NODE[$vm_id]:-$LOCAL_NODE}"
         local pid=""
         local state=""
 
@@ -455,7 +472,7 @@ is_vm_lock_stuck_in_d_state() {
 
 clear_vm_lock_if_possible() {
         local vm_id="$1"
-        local node="${VM_NODE[$vm_id]:-$HOST_NODE}"
+        local node="${VM_NODE[$vm_id]:-$LOCAL_NODE}"
         local deadline=0
 
         if ! is_vm_lock_held "$vm_id"; then
@@ -633,7 +650,7 @@ wait_for_all_restarts() {
 
 get_vm_status() {
         local vm_id="$1"
-        local node="${VM_NODE[$vm_id]:-$HOST_NODE}"
+        local node="${VM_NODE[$vm_id]:-$LOCAL_NODE}"
         run_on_vm_node "$node" "$QM_STATUS_TIMEOUT_SECONDS" /usr/sbin/qm status "$vm_id" 2>/dev/null | awk '{print $2}'
 }
 
@@ -658,7 +675,7 @@ wait_for_vm_state() {
 
 get_vm_uptime_seconds() {
         local vm_id="$1"
-        local node="${VM_NODE[$vm_id]:-$HOST_NODE}"
+        local node="${VM_NODE[$vm_id]:-$LOCAL_NODE}"
         local uptime
 
         uptime=$(run_with_timeout "$PVESH_CMD_TIMEOUT_SECONDS" /usr/bin/pvesh get "/nodes/$node/qemu/$vm_id/status/current" --output-format json 2>/dev/null | /usr/bin/jq -r '.uptime // 0' 2>/dev/null)
@@ -719,7 +736,7 @@ all_last_n_lt() {
 restart_vm() {
         local vm_id="$1"
         local reason="$2"
-        local node="${VM_NODE[$vm_id]:-$HOST_NODE}"
+        local node="${VM_NODE[$vm_id]:-$LOCAL_NODE}"
         local attempt=1
         local status=""
         local start_attempted=0
@@ -820,6 +837,22 @@ restart_vm() {
 acquire_lock "$@"
 log "--- Run at $(date) ---"
 
+if [[ -z "$LOCAL_NODE" ]]; then
+        LOCAL_NODE="$(detect_local_node)"
+fi
+
+if [[ -z "$LOCAL_NODE" ]]; then
+        log "Could not auto-detect this node's name. Set LOCAL_NODE near the top of the script. Skipping this cycle."
+        log "Check complete"
+        exit 0
+fi
+
+if [[ "$CLUSTER_WIDE" == "1" ]]; then
+        log "Running on node '$LOCAL_NODE' (cluster-wide mode)."
+else
+        log "Running on node '$LOCAL_NODE' (node-local mode)."
+fi
+
 if ! discover_watchdog_vms; then
         log "Check complete"
         exit 0
@@ -829,7 +862,7 @@ if (( ${#WATCHDOG_VMS[@]} == 0 )); then
         if [[ "$CLUSTER_WIDE" == "1" ]]; then
                 log "No VMs tagged '$WATCHDOG_TAG' found in the cluster. Nothing to monitor."
         else
-                log "No VMs tagged '$WATCHDOG_TAG' on node '$HOST_NODE'. Nothing to monitor."
+                log "No VMs tagged '$WATCHDOG_TAG' on node '$LOCAL_NODE'. Nothing to monitor."
         fi
         log "Check complete"
         exit 0
@@ -838,7 +871,7 @@ fi
 if [[ "$CLUSTER_WIDE" == "1" ]]; then
         log "Monitoring ${#WATCHDOG_VMS[@]} VM(s) tagged '$WATCHDOG_TAG' cluster-wide: $(format_watchdog_vms)"
 else
-        log "Monitoring ${#WATCHDOG_VMS[@]} VM(s) tagged '$WATCHDOG_TAG' on node '$HOST_NODE': ${WATCHDOG_VMS[*]}"
+        log "Monitoring ${#WATCHDOG_VMS[@]} VM(s) tagged '$WATCHDOG_TAG' on node '$LOCAL_NODE': ${WATCHDOG_VMS[*]}"
 fi
 cleanup_stale_qm_processes
 
@@ -875,7 +908,7 @@ for VM_ID in "${WATCHDOG_VMS[@]}"; do
         fi
 
         readarray -t CPU_VALUES < <(
-                run_with_timeout "$PVESH_CMD_TIMEOUT_SECONDS" /usr/bin/pvesh get "/nodes/${VM_NODE[$VM_ID]:-$HOST_NODE}/qemu/$VM_ID/rrddata" -timeframe hour --output-format json 2>/dev/null |
+                run_with_timeout "$PVESH_CMD_TIMEOUT_SECONDS" /usr/bin/pvesh get "/nodes/${VM_NODE[$VM_ID]:-$LOCAL_NODE}/qemu/$VM_ID/rrddata" -timeframe hour --output-format json 2>/dev/null |
                         /usr/bin/jq -r \
                                 --argjson now "$(date +%s)" \
                                 --argjson window "$SAMPLE_WINDOW_SECONDS" \
