@@ -34,6 +34,8 @@ nano /root/watchdog/monitor_vms.sh
 HOST_NODE="pve"
 
 WATCHDOG_TAG="watchdog"
+
+CLUSTER_WIDE=0
 ```
 
 - **`HOST_NODE`** — your node's name. Find it with `hostname`, or read it from
@@ -41,6 +43,9 @@ WATCHDOG_TAG="watchdog"
 - **`WATCHDOG_TAG`** — the tag that marks a VM for monitoring. The default,
   `watchdog`, matches the rest of this guide; leave it unless you want a
   different name.
+- **`CLUSTER_WIDE`** — leave at `0` to watch only this node's VMs. Set to `1` to
+  watch tagged VMs across the whole cluster from this one node (see
+  [Cluster-wide mode](#cluster-wide-mode-optional) below).
 
 Save and exit again (**Ctrl+S**, **Ctrl+X**).
 
@@ -79,6 +84,45 @@ Notes:
 - Matching is **case-insensitive** (`watchdog`, `Watchdog`, … all count) and
   matches the whole tag, so unrelated tags like `watchdog-test` are ignored.
 - **Templates are skipped** automatically, even if tagged.
+
+## Cluster-wide mode (optional)
+
+By default the watchdog only manages VMs on its own node, so in a multi-node
+cluster you would run one copy per node. Set `CLUSTER_WIDE=1` instead to watch
+**every tagged VM across the whole cluster from a single node** — one script,
+one cron job.
+
+```bash
+CLUSTER_WIDE=1
+```
+
+How it works: discovery and the CPU-history/uptime checks use the cluster-wide
+Proxmox API (`pvesh`). The VM's current run state is read with `qm status`, and
+all corrective actions (`qm` shutdown/stop/start/unlock) plus lock inspection
+(`lsof`, `ps`) run on the VM's host node over **SSH**. So if inter-node SSH is
+down, VMs on unreachable nodes are simply skipped that cycle (logged).
+
+Requirements and notes:
+
+- **Inter-node root SSH must work.** Proxmox sets up passwordless `root` SSH
+  between cluster members by default, so this normally works out of the box. You
+  can confirm with `ssh root@<other-node> qm list` from the node running the
+  watchdog. If your cluster has locked that down, the watchdog will fall back to
+  simply skipping VMs it can't reach (logged), so nothing is silently broken.
+- **`HOST_NODE` must still name the node you run it on** — it's how the script
+  tells "local" from "remote".
+- **`lsof` must be installed on every node** (lock inspection runs on the VM's
+  host node). `jq` is only needed on the node running the watchdog.
+- **Run it on one node only.** Don't also leave per-node copies running, or
+  they'll fight over the same VMs.
+- The startup log line shows where each VM lives, e.g.
+  `Monitoring 3 VM(s) tagged 'watchdog' cluster-wide: 101@pve1 104@pve2 105@pve3`.
+- The optional stale-`qm`-process cleanup (`ENABLE_STALE_QM_CLEANUP`, off by
+  default) only ever inspects the local node.
+- A VM's host node is resolved once per run. If a VM is **live-migrating** at the
+  moment the watchdog reaches it, that one cycle may target the old node and skip
+  the VM; the next run picks up the new location. No action is taken on the wrong
+  node, so this self-heals.
 
 ## Make it executable
 
