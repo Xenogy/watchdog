@@ -8,9 +8,14 @@ if [[ "${VM_MONITOR_SKIP_REDIRECT:-0}" != "1" ]]; then
         exec > >(tee -a "$CRON_LOG_FILE") 2>&1
 fi
 
-# REQUIRED: Enter host node name and VM IDs to monitor.
+# REQUIRED: Enter the Proxmox host node name (find it with `hostname`).
 HOST_NODE="pve"
-MONITOR_VMS=("101" "102" "103" "104")
+
+# VMs to monitor are selected dynamically by tag: every VM carrying this tag is
+# watched. Add or remove the tag in the Proxmox UI (or with
+# `qm set <vmid> --tags <tag>`) to enable/disable monitoring for a VM without
+# editing this script. Matching is case-insensitive.
+WATCHDOG_TAG="watchdog"
 
 LOG_FILE="/var/log/vm_monitor.log"
 
@@ -52,6 +57,9 @@ fi
 
 RESTART_PIDS=()
 declare -A RESTART_META=()
+
+# Populated fresh on every run by discover_watchdog_vms.
+WATCHDOG_VMS=()
 
 log() {
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
@@ -105,13 +113,127 @@ is_monitored_vm() {
         local target_vm_id="$1"
         local vm_id=""
 
-        for vm_id in "${MONITOR_VMS[@]}"; do
+        for vm_id in "${WATCHDOG_VMS[@]}"; do
                 if [[ "$vm_id" == "$target_vm_id" ]]; then
                         return 0
                 fi
         done
 
         return 1
+}
+
+# Read a VM's tags from its live config and print the raw (semicolon-separated)
+# tag string to stdout. Returns 0 when the config was read successfully (the tag
+# string may legitimately be empty), and non-zero when the lookup itself failed
+# or timed out. Callers must NOT treat a failed read as "no tags": that would
+# abandon a VM precisely when the node is too busy to answer quickly.
+get_vm_tags() {
+        local vm_id="$1"
+        local raw=""
+        local rc=0
+
+        raw=$(run_with_timeout "$PVESH_CMD_TIMEOUT_SECONDS" /usr/bin/pvesh get "/nodes/$HOST_NODE/qemu/$vm_id/config" --output-format json 2>/dev/null)
+        rc=$?
+        if (( rc != 0 )) || [[ -z "$raw" ]]; then
+                return 1
+        fi
+
+        printf '%s' "$raw" | /usr/bin/jq -r '.tags // ""' 2>/dev/null
+        return 0
+}
+
+# Return 0 if the given tag string contains the watchdog tag. Proxmox stores
+# tags separated by ';'; we also tolerate ',' and whitespace, and match
+# case-insensitively so "watchdog", "Watchdog", etc. all count. Splitting with
+# `read -ra` (rather than an unquoted `for`) keeps tags that contain glob
+# characters from being expanded against the filesystem.
+tags_contain_watchdog() {
+        local tags="$1"
+        local want="${WATCHDOG_TAG,,}"
+        local parts=()
+        local tag=""
+        local IFS=$'; \t,'
+
+        read -ra parts <<< "$tags"
+        for tag in "${parts[@]}"; do
+                if [[ "${tag,,}" == "$want" ]]; then
+                        return 0
+                fi
+        done
+
+        return 1
+}
+
+# Re-check, against the live config, whether a VM currently carries the watchdog
+# tag. Used for discovery and for the re-check immediately before acting on a VM
+# (so a tag removed mid-run is honoured). Exit codes:
+#   0 - tag is present
+#   1 - config read succeeded and the tag is absent
+#   2 - config read failed/timed out (tag state unknown)
+# Distinguishing 2 from 1 lets callers avoid treating a transient pvesh failure
+# as "tag removed".
+vm_has_watchdog_tag() {
+        local vm_id="$1"
+        local tags=""
+        local rc=0
+
+        tags=$(get_vm_tags "$vm_id")
+        rc=$?
+        if (( rc != 0 )); then
+                return 2
+        fi
+
+        if tags_contain_watchdog "$tags"; then
+                return 0
+        fi
+
+        return 1
+}
+
+# Enumerate every VM on the node carrying the watchdog tag and populate the
+# WATCHDOG_VMS array. Returns non-zero only when the VM list cannot be read at
+# all, so the caller can skip the cycle instead of mistaking a failed lookup
+# for "nothing is tagged". A per-VM tag read that fails is logged and that VM is
+# left out for this cycle (reconsidered next run) rather than being silently
+# dropped or restarted while its tag state is unknown.
+discover_watchdog_vms() {
+        local index_json=""
+        local vm_ids=()
+        local vm_id=""
+        local tags=""
+        local rc=0
+
+        index_json=$(run_with_timeout "$PVESH_CMD_TIMEOUT_SECONDS" /usr/bin/pvesh get "/nodes/$HOST_NODE/qemu" --output-format json 2>/dev/null)
+
+        if [[ -z "$index_json" ]] || ! echo "$index_json" | /usr/bin/jq -e 'type == "array"' >/dev/null 2>&1; then
+                log "Unable to enumerate VMs on node '$HOST_NODE' (pvesh failed or returned no data). Skipping this cycle."
+                return 1
+        fi
+
+        # Skip templates: they never run and must never be "restarted". The flag
+        # may render as a number, string or boolean across PVE versions, so the
+        # match is type-agnostic.
+        readarray -t vm_ids < <(echo "$index_json" | /usr/bin/jq -r '.[] | select((.template // false) | tostring | (. == "1" or . == "true") | not) | .vmid' 2>/dev/null | sort -n)
+
+        WATCHDOG_VMS=()
+        for vm_id in "${vm_ids[@]}"; do
+                if [[ -z "$vm_id" ]]; then
+                        continue
+                fi
+
+                tags=$(get_vm_tags "$vm_id")
+                rc=$?
+                if (( rc != 0 )); then
+                        log "Unable to read tags for VM $vm_id (pvesh failed); excluding it from this cycle."
+                        continue
+                fi
+
+                if tags_contain_watchdog "$tags"; then
+                        WATCHDOG_VMS+=("$vm_id")
+                fi
+        done
+
+        return 0
 }
 
 cleanup_stale_qm_processes() {
@@ -471,6 +593,16 @@ restart_vm() {
         local start_attempted=0
 
         while (( attempt <= RESTART_RETRIES )); do
+                # Honour a tag removed mid-restart: bail out before escalating
+                # further, but only when the live config read confirms the tag
+                # is gone (rc 1) -- never on an inconclusive read (rc 2), so a
+                # transient pvesh hiccup can't abort a restart in progress.
+                vm_has_watchdog_tag "$vm_id"
+                if (( $? == 1 )); then
+                        log "VM $vm_id lost the '$WATCHDOG_TAG' tag during restart (reason: $reason). Aborting further attempts."
+                        return 0
+                fi
+
                 log "VM $vm_id restart attempt $attempt/$RESTART_RETRIES (reason: $reason)"
 
                 status=$(get_vm_status "$vm_id")
@@ -555,11 +687,33 @@ restart_vm() {
 
 acquire_lock "$@"
 log "--- Run at $(date) ---"
+
+if ! discover_watchdog_vms; then
+        log "Check complete"
+        exit 0
+fi
+
+if (( ${#WATCHDOG_VMS[@]} == 0 )); then
+        log "No VMs tagged '$WATCHDOG_TAG' on node '$HOST_NODE'. Nothing to monitor."
+        log "Check complete"
+        exit 0
+fi
+
+log "Monitoring ${#WATCHDOG_VMS[@]} VM(s) tagged '$WATCHDOG_TAG': ${WATCHDOG_VMS[*]}"
 cleanup_stale_qm_processes
 
-for VM_ID in "${MONITOR_VMS[@]}"; do
+for VM_ID in "${WATCHDOG_VMS[@]}"; do
         reap_finished_restarts
         log "Checking VM: $VM_ID"
+
+        vm_has_watchdog_tag "$VM_ID"
+        TAG_RECHECK_RC=$?
+        if (( TAG_RECHECK_RC == 1 )); then
+                log "VM $VM_ID no longer carries the '$WATCHDOG_TAG' tag (removed since this run began). Skipping."
+                continue
+        elif (( TAG_RECHECK_RC == 2 )); then
+                log "VM $VM_ID tag re-check inconclusive (pvesh read failed); proceeding based on discovery."
+        fi
 
         VM_STATUS=$(get_vm_status "$VM_ID")
         if [[ -z "$VM_STATUS" ]]; then
