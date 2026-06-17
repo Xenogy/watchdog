@@ -19,6 +19,15 @@ LOCAL_NODE=""
 # editing this script. Matching is case-insensitive.
 WATCHDOG_TAG="watchdog"
 
+# While the watchdog is actively restarting a VM it adds this transient tag to
+# that VM, then removes it once the restart finishes (whether it succeeded or
+# failed). This makes an in-progress restart visible in the Proxmox UI and lets
+# other automation hold off on touching a VM until the tag disappears. The tag
+# is also stripped from any monitored VM at startup, in case a previous run was
+# killed mid-restart and left it behind. Matching is case-insensitive. Set this
+# empty ("") to disable the feature entirely.
+WATCHDOG_ACTIVE_TAG="watchdog-active"
+
 # Optional cluster-wide mode.
 #   0 (default) - only manage VMs on LOCAL_NODE, using local commands exactly as
 #                 before.
@@ -254,26 +263,75 @@ get_vm_tags() {
         return 0
 }
 
-# Return 0 if the given tag string contains the watchdog tag. Proxmox stores
-# tags separated by ';'; we also tolerate ',' and whitespace, and match
-# case-insensitively so "watchdog", "Watchdog", etc. all count. Splitting with
-# `read -ra` (rather than an unquoted `for`) keeps tags that contain glob
-# characters from being expanded against the filesystem.
-tags_contain_watchdog() {
+# Split a raw Proxmox tag string into its individual tags, one per line (empties
+# dropped). Proxmox stores tags separated by ';'; we also tolerate ',' and
+# whitespace. Splitting with `read -ra` (rather than an unquoted `for`) keeps
+# tags that contain glob characters from being expanded against the filesystem.
+split_tags() {
         local tags="$1"
-        local want="${WATCHDOG_TAG,,}"
         local parts=()
         local tag=""
         local IFS=$'; \t,'
 
         read -ra parts <<< "$tags"
         for tag in "${parts[@]}"; do
+                if [[ -n "$tag" ]]; then
+                        printf '%s\n' "$tag"
+                fi
+        done
+}
+
+# Return 0 if the given tag string contains `want` as a whole tag, matched
+# case-insensitively (so "watchdog", "Watchdog", etc. all count, while
+# "watchdog-test" does not match "watchdog").
+tags_contain_tag() {
+        local tags="$1"
+        local want="${2,,}"
+        local tag=""
+
+        while IFS= read -r tag; do
                 if [[ "${tag,,}" == "$want" ]]; then
                         return 0
                 fi
-        done
+        done < <(split_tags "$tags")
 
         return 1
+}
+
+# Return 0 if the given tag string contains the watchdog tag.
+tags_contain_watchdog() {
+        tags_contain_tag "$1" "$WATCHDOG_TAG"
+}
+
+# Re-emit a tag string as a normalized ';'-joined list, optionally dropping every
+# case-insensitive match of `drop` and/or appending `add` when it is not already
+# present (also case-insensitive). Either may be empty. This is the read side of
+# the read-modify-write used to add/remove the transient active tag without
+# disturbing a VM's other tags.
+rebuild_tags() {
+        local tags="$1"
+        local drop="${2,,}"
+        local add="$3"
+        local kept=()
+        local tag=""
+        local have_add=0
+
+        while IFS= read -r tag; do
+                if [[ -n "$drop" && "${tag,,}" == "$drop" ]]; then
+                        continue
+                fi
+                if [[ -n "$add" && "${tag,,}" == "${add,,}" ]]; then
+                        have_add=1
+                fi
+                kept+=("$tag")
+        done < <(split_tags "$tags")
+
+        if [[ -n "$add" && "$have_add" -eq 0 ]]; then
+                kept+=("$add")
+        fi
+
+        local IFS=";"
+        printf '%s' "${kept[*]}"
 }
 
 # Re-check, against the live config, whether a VM currently carries the watchdog
@@ -300,6 +358,101 @@ vm_has_watchdog_tag() {
         fi
 
         return 1
+}
+
+# Write a VM's tag list, replacing it wholesale with `new_tags` (Proxmox has no
+# atomic per-tag add/remove, so callers read-modify-write the full string). Uses
+# pvesh, which proxies through the cluster API and so reaches VMs on any node in
+# both node-local and cluster-wide mode -- matching how get_vm_tags reads them.
+# Returns pvesh's exit status.
+write_vm_tags() {
+        local vm_id="$1"
+        local new_tags="$2"
+        local node="${VM_NODE[$vm_id]:-$LOCAL_NODE}"
+
+        run_with_timeout "$PVESH_CMD_TIMEOUT_SECONDS" /usr/bin/pvesh set "/nodes/$node/qemu/$vm_id/config" --tags "$new_tags" >/dev/null 2>&1
+}
+
+# Add WATCHDOG_ACTIVE_TAG to a VM (read-modify-write), preserving its other tags.
+# Best-effort and never fatal: a failure here must not stop a restart, so the
+# worst case is that the visibility tag is missing, not that recovery is skipped.
+add_active_tag() {
+        local vm_id="$1"
+        local tags=""
+
+        if [[ -z "$WATCHDOG_ACTIVE_TAG" ]]; then
+                return 0
+        fi
+
+        tags=$(get_vm_tags "$vm_id")
+        if (( $? != 0 )); then
+                log "VM $vm_id: could not read tags to add '$WATCHDOG_ACTIVE_TAG' (continuing without it)."
+                return 0
+        fi
+
+        if tags_contain_tag "$tags" "$WATCHDOG_ACTIVE_TAG"; then
+                return 0
+        fi
+
+        if write_vm_tags "$vm_id" "$(rebuild_tags "$tags" "" "$WATCHDOG_ACTIVE_TAG")"; then
+                log "VM $vm_id: added '$WATCHDOG_ACTIVE_TAG' tag (restart in progress)."
+        else
+                log "VM $vm_id: failed to add '$WATCHDOG_ACTIVE_TAG' tag (continuing)."
+        fi
+
+        return 0
+}
+
+# Remove WATCHDOG_ACTIVE_TAG from a VM (read-modify-write), leaving its other
+# tags intact. `context` tailors the log message (e.g. "restart finished" vs a
+# stale tag swept up at startup). Best-effort; a failure leaves the tag lingering
+# but is logged so it can be noticed.
+remove_active_tag() {
+        local vm_id="$1"
+        local context="${2:-restart finished}"
+        local tags=""
+
+        if [[ -z "$WATCHDOG_ACTIVE_TAG" ]]; then
+                return 0
+        fi
+
+        tags=$(get_vm_tags "$vm_id")
+        if (( $? != 0 )); then
+                log "VM $vm_id: could not read tags to remove '$WATCHDOG_ACTIVE_TAG' ($context); it may linger."
+                return 0
+        fi
+
+        if ! tags_contain_tag "$tags" "$WATCHDOG_ACTIVE_TAG"; then
+                return 0
+        fi
+
+        if write_vm_tags "$vm_id" "$(rebuild_tags "$tags" "$WATCHDOG_ACTIVE_TAG" "")"; then
+                log "VM $vm_id: removed '$WATCHDOG_ACTIVE_TAG' tag ($context)."
+        else
+                log "VM $vm_id: failed to remove '$WATCHDOG_ACTIVE_TAG' tag ($context); it may linger."
+        fi
+
+        return 0
+}
+
+# Sweep up WATCHDOG_ACTIVE_TAG left on any monitored VM by a previous run that
+# was killed mid-restart. Safe to run only at startup, before any restart begins:
+# the flock guarantees no other watchdog instance is running, so any active tag
+# present now is necessarily stale.
+clear_stale_active_tags() {
+        local vm_id=""
+        local tags=""
+
+        if [[ -z "$WATCHDOG_ACTIVE_TAG" ]]; then
+                return 0
+        fi
+
+        for vm_id in "${WATCHDOG_VMS[@]}"; do
+                tags=$(get_vm_tags "$vm_id") || continue
+                if tags_contain_tag "$tags" "$WATCHDOG_ACTIVE_TAG"; then
+                        remove_active_tag "$vm_id" "stale tag from an interrupted previous run"
+                fi
+        done
 }
 
 # Populate WATCHDOG_VMS (and, in cluster mode, VM_NODE) with the VMs carrying
@@ -777,7 +930,25 @@ all_last_n_lt() {
         return 0
 }
 
+# Public entry point for a restart. Wraps the core retry logic so the transient
+# WATCHDOG_ACTIVE_TAG is added right before any qm action and removed once the
+# restart finishes, on every exit path (success, failure, or mid-run tag loss).
+# Runs in the foreground or inside queue_restart's background subshell; either
+# way the add/remove bracket the whole attempt for this VM.
 restart_vm() {
+        local vm_id="$1"
+        local reason="$2"
+        local rc=0
+
+        add_active_tag "$vm_id"
+        restart_vm_core "$vm_id" "$reason"
+        rc=$?
+        remove_active_tag "$vm_id"
+
+        return "$rc"
+}
+
+restart_vm_core() {
         local vm_id="$1"
         local reason="$2"
         local node="${VM_NODE[$vm_id]:-$LOCAL_NODE}"
@@ -924,6 +1095,7 @@ else
         log "Monitoring ${#WATCHDOG_VMS[@]} VM(s) tagged '$WATCHDOG_TAG' on node '$LOCAL_NODE': ${WATCHDOG_VMS[*]}"
 fi
 cleanup_stale_qm_processes
+clear_stale_active_tags
 
 for VM_ID in "${WATCHDOG_VMS[@]}"; do
         reap_finished_restarts

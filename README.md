@@ -33,12 +33,18 @@ nano /root/watchdog/monitor_vms.sh
 ```bash
 WATCHDOG_TAG="watchdog"
 
+WATCHDOG_ACTIVE_TAG="watchdog-active"
+
 CLUSTER_WIDE=0
 ```
 
 - **`WATCHDOG_TAG`** — the tag that marks a VM for monitoring. The default,
   `watchdog`, matches the rest of this guide; leave it unless you want a
   different name.
+- **`WATCHDOG_ACTIVE_TAG`** — a transient tag the watchdog adds to a VM while it
+  is restarting it, then removes when the restart finishes (see
+  [The "active" tag](#the-active-tag) below). Set it to `""` to turn the feature
+  off.
 - **`CLUSTER_WIDE`** — leave at `0` to watch only this node's VMs. Set to `1` to
   watch tagged VMs across the whole cluster from this one node (see
   [Cluster-wide mode](#cluster-wide-mode-optional) below).
@@ -84,6 +90,37 @@ Notes:
 - Matching is **case-insensitive** (`watchdog`, `Watchdog`, … all count) and
   matches the whole tag, so unrelated tags like `watchdog-test` are ignored.
 - **Templates are skipped** automatically, even if tagged.
+
+## The "active" tag
+
+While the watchdog is actually restarting a VM, it tags that VM with
+`watchdog-active` (configurable via `WATCHDOG_ACTIVE_TAG`) and removes the tag as
+soon as the restart finishes — whether it succeeded, failed, or was aborted
+because the `watchdog` tag was pulled mid-run. The VM's other tags are left
+untouched.
+
+This gives you two things:
+
+- **Visibility** — a VM currently being recovered is obvious at a glance in the
+  Proxmox UI and in `qm config`/`pvesh` output.
+- **Coordination** — other automation can watch for this tag and hold off on
+  touching a VM until it disappears, so nothing fights the watchdog while it is
+  stopping/starting a guest.
+
+So the lifecycle of a healthy, watched VM is: it carries `watchdog`; if the
+watchdog ever has to restart it, `watchdog-active` appears for the duration of
+the restart and then goes away again.
+
+A couple of details:
+
+- The tag is added only when a restart is genuinely attempted — not when a VM is
+  skipped (e.g. still in its restart cooldown, or its lock holder is stuck).
+- If a run is **killed mid-restart** (host reboot, `kill -9`, …) the tag can be
+  left behind. To prevent it from lingering forever, the watchdog strips any
+  pre-existing `watchdog-active` from monitored VMs at the **start** of each run,
+  before it begins any work — safe because only one run executes at a time.
+- Set `WATCHDOG_ACTIVE_TAG=""` to disable the feature entirely (no tag is ever
+  added, and the startup cleanup is skipped).
 
 ## Cluster-wide mode (optional)
 
