@@ -28,6 +28,19 @@ WATCHDOG_TAG="watchdog"
 # empty ("") to disable the feature entirely.
 WATCHDOG_ACTIVE_TAG="watchdog-active"
 
+# When 1, the WATCHDOG_ACTIVE_TAG above is also applied while the watchdog is
+# merely *examining* a VM (not just while restarting it): the tag is added as
+# each VM's check begins and removed as it ends, so the tag visibly steps from
+# one VM to the next and you can watch the run progress in the Proxmox UI. If a
+# check decides to restart, the tag simply stays on through the restart.
+#   1 (default) - tag every VM for the duration of its check (visual progress).
+#   0           - tag a VM only while it is actually being restarted, so the
+#                 tag's presence strictly means "the watchdog is changing this
+#                 VM" -- cleaner as a do-not-touch signal for other automation,
+#                 and avoids a tag write per VM per run.
+# Has no effect when WATCHDOG_ACTIVE_TAG is empty.
+TAG_DURING_CHECK=1
+
 # Optional cluster-wide mode.
 #   0 (default) - only manage VMs on LOCAL_NODE, using local commands exactly as
 #                 before.
@@ -374,10 +387,13 @@ write_vm_tags() {
 }
 
 # Add WATCHDOG_ACTIVE_TAG to a VM (read-modify-write), preserving its other tags.
-# Best-effort and never fatal: a failure here must not stop a restart, so the
-# worst case is that the visibility tag is missing, not that recovery is skipped.
+# `context` tailors the log message to why the tag is going on (e.g. a restart vs
+# a plain check). Best-effort and never fatal: a failure here must not stop a
+# restart, so the worst case is that the visibility tag is missing, not that
+# recovery is skipped.
 add_active_tag() {
         local vm_id="$1"
+        local context="${2:-restart in progress}"
         local tags=""
 
         if [[ -z "$WATCHDOG_ACTIVE_TAG" ]]; then
@@ -386,7 +402,7 @@ add_active_tag() {
 
         tags=$(get_vm_tags "$vm_id")
         if (( $? != 0 )); then
-                log "VM $vm_id: could not read tags to add '$WATCHDOG_ACTIVE_TAG' (continuing without it)."
+                log "VM $vm_id: could not read tags to add '$WATCHDOG_ACTIVE_TAG' ($context); continuing without it."
                 return 0
         fi
 
@@ -395,9 +411,9 @@ add_active_tag() {
         fi
 
         if write_vm_tags "$vm_id" "$(rebuild_tags "$tags" "" "$WATCHDOG_ACTIVE_TAG")"; then
-                log "VM $vm_id: added '$WATCHDOG_ACTIVE_TAG' tag (restart in progress)."
+                log "VM $vm_id: added '$WATCHDOG_ACTIVE_TAG' tag ($context)."
         else
-                log "VM $vm_id: failed to add '$WATCHDOG_ACTIVE_TAG' tag (continuing)."
+                log "VM $vm_id: failed to add '$WATCHDOG_ACTIVE_TAG' tag ($context); continuing."
         fi
 
         return 0
@@ -787,6 +803,14 @@ reap_finished_restarts() {
         RESTART_PIDS=("${active_pids[@]}")
 }
 
+# Decide on and dispatch a restart for a VM. Return codes tell the caller who is
+# responsible for the transient active tag afterwards:
+#   2 - a restart was launched in the *background* (parallel mode); it owns the
+#       active tag and clears it when it finishes, so the caller must not.
+#   0 - nothing is running asynchronously for this VM: either the restart ran
+#       synchronously and already cleared its own tag, or the restart was skipped
+#       (cooldown / stuck lock) and never touched the tag. Either way the caller
+#       is free to drop a check-phase tag it added.
 queue_restart() {
         local vm_id="$1"
         local reason="$2"
@@ -794,11 +818,11 @@ queue_restart() {
 
         if (( BLOCK_RESTARTS_WHEN_STUCK_TASKS == 1 )) && is_vm_lock_held "$vm_id" && is_vm_lock_stuck_in_d_state "$vm_id"; then
                 log "Skipping restart for VM $vm_id (reason: $reason) because its qemu lock holder is stuck in D state."
-                return
+                return 0
         fi
 
         if is_restart_in_cooldown "$vm_id" "$reason"; then
-                return
+                return 0
         fi
 
         if (( MAX_PARALLEL_RESTARTS <= 1 )); then
@@ -806,7 +830,7 @@ queue_restart() {
                 if restart_vm "$vm_id" "$reason"; then
                         record_restart_attempt "$vm_id" "$reason"
                 fi
-                return
+                return 0
         fi
 
         while (( ${#RESTART_PIDS[@]} >= MAX_PARALLEL_RESTARTS )); do
@@ -826,6 +850,7 @@ queue_restart() {
 
         RESTART_PIDS+=("$pid")
         RESTART_META["$pid"]="restart VM $vm_id (reason: $reason)"
+        return 2
 }
 
 wait_for_all_restarts() {
@@ -1049,6 +1074,84 @@ restart_vm_core() {
         return 1
 }
 
+# Examine one monitored VM and restart it if it is in a bad run state or its CPU
+# history looks stalled. The caller has already confirmed the VM still carries
+# the watchdog tag. Mirrors queue_restart's tag-ownership contract:
+#   2 - a background restart was launched and owns the active tag (caller must
+#       leave it in place).
+#   0 - examined with no outstanding async work for this VM (caller may drop a
+#       check-phase tag it added).
+evaluate_vm() {
+        local vm_id="$1"
+        local vm_status=""
+        local cpu_values=()
+        local sample_count=0
+        local latest_cpu=""
+        local vm_uptime_seconds=0
+
+        vm_status=$(get_vm_status "$vm_id")
+        if [[ -z "$vm_status" ]]; then
+                log "Unable to read status for VM $vm_id. Skipping this cycle."
+                return 0
+        fi
+
+        if [[ "$vm_status" != "running" ]]; then
+                if [[ "$vm_status" == "stopped" ]] && is_vm_lock_held "$vm_id"; then
+                        log "VM $vm_id is stopped but has active qemu lock holder: $(get_vm_lock_holders "$vm_id"). Attempting unlock."
+                        if ! clear_vm_lock_if_possible "$vm_id"; then
+                                return 0
+                        fi
+                fi
+
+                log "VM $vm_id is '$vm_status'. Attempting recovery restart."
+                queue_restart "$vm_id" "status_$vm_status"
+                return $?
+        fi
+
+        readarray -t cpu_values < <(
+                run_with_timeout "$PVESH_CMD_TIMEOUT_SECONDS" /usr/bin/pvesh get "/nodes/${VM_NODE[$vm_id]:-$LOCAL_NODE}/qemu/$vm_id/rrddata" -timeframe hour --output-format json 2>/dev/null |
+                        /usr/bin/jq -r \
+                                --argjson now "$(date +%s)" \
+                                --argjson window "$SAMPLE_WINDOW_SECONDS" \
+                                --argjson max_points "$MAX_CONSECUTIVE_POINTS" \
+                                'map(select(.time > ($now - $window) and .cpu != null)) | sort_by(.time) | .[-$max_points:] | .[].cpu * 100 | floor' 2>/dev/null
+        )
+
+        sample_count="${#cpu_values[@]}"
+        if (( sample_count == 0 )); then
+                log "No recent CPU samples for VM $vm_id. Skipping."
+                return 0
+        fi
+
+        latest_cpu="${cpu_values[$((sample_count - 1))]}"
+
+        if all_last_n_ge "$HIGH_CPU_THRESHOLD" "$HIGH_CONSECUTIVE_POINTS" "${cpu_values[@]}"; then
+                log "VM $vm_id high-CPU lock detected (${HIGH_CONSECUTIVE_POINTS} consecutive samples >= ${HIGH_CPU_THRESHOLD}%, latest=${latest_cpu}%)."
+                queue_restart "$vm_id" "high_cpu_stall"
+                return $?
+        fi
+
+        if all_last_n_lt "$LOW_CPU_THRESHOLD" "$LOW_CONSECUTIVE_POINTS" "${cpu_values[@]}"; then
+                vm_uptime_seconds=$(get_vm_uptime_seconds "$vm_id")
+                if (( vm_uptime_seconds < LOW_CPU_BOOT_GRACE_SECONDS )); then
+                        log "VM $vm_id uptime ${vm_uptime_seconds}s < ${LOW_CPU_BOOT_GRACE_SECONDS}s boot grace. Skipping low-CPU check."
+                        return 0
+                fi
+
+                if (( ENABLE_LOW_CPU_RESTART != 1 )); then
+                        log "VM $vm_id sustained low CPU (${LOW_CONSECUTIVE_POINTS} samples < ${LOW_CPU_THRESHOLD}%, latest=${latest_cpu}%), but low-CPU restart is disabled."
+                        return 0
+                fi
+
+                log "VM $vm_id low-CPU stall detected (${LOW_CONSECUTIVE_POINTS} consecutive samples < ${LOW_CPU_THRESHOLD}%, latest=${latest_cpu}%)."
+                queue_restart "$vm_id" "low_cpu_stall"
+                return $?
+        fi
+
+        log "VM $vm_id healthy (latest CPU=${latest_cpu}%)."
+        return 0
+}
+
 acquire_lock "$@"
 log "--- Run at $(date) ---"
 
@@ -1110,64 +1213,21 @@ for VM_ID in "${WATCHDOG_VMS[@]}"; do
                 log "VM $VM_ID tag re-check inconclusive (pvesh read failed); proceeding based on discovery."
         fi
 
-        VM_STATUS=$(get_vm_status "$VM_ID")
-        if [[ -z "$VM_STATUS" ]]; then
-                log "Unable to read status for VM $VM_ID. Skipping this cycle."
-                continue
+        # Optionally mark this VM as the one under examination so the run's
+        # progress is visible in the Proxmox UI. The tag is dropped again below
+        # once the VM has been evaluated -- unless that evaluation launched a
+        # background restart, which then owns the tag until it finishes.
+        CHECK_TAG_ADDED=0
+        if [[ "$TAG_DURING_CHECK" == "1" ]]; then
+                add_active_tag "$VM_ID" "examining"
+                CHECK_TAG_ADDED=1
         fi
 
-        if [[ "$VM_STATUS" != "running" ]]; then
-                if [[ "$VM_STATUS" == "stopped" ]] && is_vm_lock_held "$VM_ID"; then
-                        log "VM $VM_ID is stopped but has active qemu lock holder: $(get_vm_lock_holders "$VM_ID"). Attempting unlock."
-                        if ! clear_vm_lock_if_possible "$VM_ID"; then
-                                continue
-                        fi
-                fi
+        evaluate_vm "$VM_ID"
+        EVAL_RC=$?
 
-                log "VM $VM_ID is '$VM_STATUS'. Attempting recovery restart."
-                queue_restart "$VM_ID" "status_$VM_STATUS"
-                continue
-        fi
-
-        readarray -t CPU_VALUES < <(
-                run_with_timeout "$PVESH_CMD_TIMEOUT_SECONDS" /usr/bin/pvesh get "/nodes/${VM_NODE[$VM_ID]:-$LOCAL_NODE}/qemu/$VM_ID/rrddata" -timeframe hour --output-format json 2>/dev/null |
-                        /usr/bin/jq -r \
-                                --argjson now "$(date +%s)" \
-                                --argjson window "$SAMPLE_WINDOW_SECONDS" \
-                                --argjson max_points "$MAX_CONSECUTIVE_POINTS" \
-                                'map(select(.time > ($now - $window) and .cpu != null)) | sort_by(.time) | .[-$max_points:] | .[].cpu * 100 | floor' 2>/dev/null
-        )
-
-        SAMPLE_COUNT="${#CPU_VALUES[@]}"
-        if (( SAMPLE_COUNT == 0 )); then
-                log "No recent CPU samples for VM $VM_ID. Skipping."
-                continue
-        fi
-
-        LATEST_CPU="${CPU_VALUES[$((SAMPLE_COUNT - 1))]}"
-
-        if all_last_n_ge "$HIGH_CPU_THRESHOLD" "$HIGH_CONSECUTIVE_POINTS" "${CPU_VALUES[@]}"; then
-                log "VM $VM_ID high-CPU lock detected (${HIGH_CONSECUTIVE_POINTS} consecutive samples >= ${HIGH_CPU_THRESHOLD}%, latest=${LATEST_CPU}%)."
-                queue_restart "$VM_ID" "high_cpu_stall"
-                continue
-        fi
-
-        if all_last_n_lt "$LOW_CPU_THRESHOLD" "$LOW_CONSECUTIVE_POINTS" "${CPU_VALUES[@]}"; then
-                VM_UPTIME_SECONDS=$(get_vm_uptime_seconds "$VM_ID")
-                if (( VM_UPTIME_SECONDS < LOW_CPU_BOOT_GRACE_SECONDS )); then
-                        log "VM $VM_ID uptime ${VM_UPTIME_SECONDS}s < ${LOW_CPU_BOOT_GRACE_SECONDS}s boot grace. Skipping low-CPU check."
-                        continue
-                fi
-
-                if (( ENABLE_LOW_CPU_RESTART != 1 )); then
-                        log "VM $VM_ID sustained low CPU (${LOW_CONSECUTIVE_POINTS} samples < ${LOW_CPU_THRESHOLD}%, latest=${LATEST_CPU}%), but low-CPU restart is disabled."
-                        continue
-                fi
-
-                log "VM $VM_ID low-CPU stall detected (${LOW_CONSECUTIVE_POINTS} consecutive samples < ${LOW_CPU_THRESHOLD}%, latest=${LATEST_CPU}%)."
-                queue_restart "$VM_ID" "low_cpu_stall"
-        else
-                log "VM $VM_ID healthy (latest CPU=${LATEST_CPU}%)."
+        if (( CHECK_TAG_ADDED == 1 )) && (( EVAL_RC != 2 )); then
+                remove_active_tag "$VM_ID" "check complete"
         fi
 done
 
