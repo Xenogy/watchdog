@@ -19,26 +19,8 @@ LOCAL_NODE=""
 # editing this script. Matching is case-insensitive.
 WATCHDOG_TAG="watchdog"
 
-# While the watchdog is actively restarting a VM it adds this transient tag to
-# that VM, then removes it once the restart finishes (whether it succeeded or
-# failed). This makes an in-progress restart visible in the Proxmox UI and lets
-# other automation hold off on touching a VM until the tag disappears. The tag
-# is also stripped from any monitored VM at startup, in case a previous run was
-# killed mid-restart and left it behind. Matching is case-insensitive. Set this
-# empty ("") to disable the feature entirely.
+# While the watchdog is actively restarting a VM it adds this transient tag to that VM
 WATCHDOG_ACTIVE_TAG="watchdog-active"
-
-# When 1, the WATCHDOG_ACTIVE_TAG above is also applied while the watchdog is
-# merely *examining* a VM (not just while restarting it): the tag is added as
-# each VM's check begins and removed as it ends, so the tag visibly steps from
-# one VM to the next and you can watch the run progress in the Proxmox UI. If a
-# check decides to restart, the tag simply stays on through the restart.
-#   1 (default) - tag every VM for the duration of its check (visual progress).
-#   0           - tag a VM only while it is actually being restarted, so the
-#                 tag's presence strictly means "the watchdog is changing this
-#                 VM" -- cleaner as a do-not-touch signal for other automation,
-#                 and avoids a tag write per VM per run.
-# Has no effect when WATCHDOG_ACTIVE_TAG is empty.
 TAG_DURING_CHECK=0
 
 # Optional cluster-wide mode.
