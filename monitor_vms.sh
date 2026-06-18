@@ -84,6 +84,13 @@ VM_LOCK_CLEAR_WAIT_SECONDS=20
 VM_LOCK_CLEAR_RETRY_SECONDS=2
 BLOCK_RESTARTS_WHEN_STUCK_TASKS=1
 
+# How often run_with_timeout polls a child for completion. This is the floor on
+# how long every pvesh/qm/lsof call takes, so it must stay well under a second:
+# a typical pvesh call returns in well under 100ms, and the script makes many of
+# them sequentially (one or more per VM). A coarse 1s poll would add ~1s to every
+# single call. Accepts fractional seconds (GNU sleep).
+WAIT_POLL_INTERVAL_SECONDS=0.1
+
 MAX_CONSECUTIVE_POINTS=$HIGH_CONSECUTIVE_POINTS
 if (( LOW_CONSECUTIVE_POINTS > MAX_CONSECUTIVE_POINTS )); then
         MAX_CONSECUTIVE_POINTS=$LOW_CONSECUTIVE_POINTS
@@ -104,6 +111,11 @@ declare -A VM_NODE=()
 # targets the IP directly rather than the bare node name -- which often does not
 # resolve via DNS/hosts. Only populated in cluster-wide mode.
 declare -A NODE_IP=()
+
+# Snapshot of each monitored VM's tag string as read during discovery, so the
+# startup stale-tag sweep can check for a leftover active tag without paying for
+# a second per-VM config read.
+declare -A VM_TAGS_SNAPSHOT=()
 
 log() {
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
@@ -198,7 +210,7 @@ run_with_timeout() {
                         return 124
                 fi
 
-                sleep 1
+                sleep "$WAIT_POLL_INTERVAL_SECONDS"
         done
 
         wait "$child_pid"
@@ -455,17 +467,20 @@ remove_active_tag() {
 # was killed mid-restart. Safe to run only at startup, before any restart begins:
 # the flock guarantees no other watchdog instance is running, so any active tag
 # present now is necessarily stale.
+#
+# To stay cheap, this reuses the tag strings discovery already read
+# (VM_TAGS_SNAPSHOT) instead of re-reading every VM's config: in the common case
+# (no leftover tags) it makes no Proxmox calls at all, and it only reads+writes
+# for a VM that genuinely still carries the active tag.
 clear_stale_active_tags() {
         local vm_id=""
-        local tags=""
 
         if [[ -z "$WATCHDOG_ACTIVE_TAG" ]]; then
                 return 0
         fi
 
         for vm_id in "${WATCHDOG_VMS[@]}"; do
-                tags=$(get_vm_tags "$vm_id") || continue
-                if tags_contain_tag "$tags" "$WATCHDOG_ACTIVE_TAG"; then
+                if tags_contain_tag "${VM_TAGS_SNAPSHOT[$vm_id]:-}" "$WATCHDOG_ACTIVE_TAG"; then
                         remove_active_tag "$vm_id" "stale tag from an interrupted previous run"
                 fi
         done
@@ -478,6 +493,7 @@ clear_stale_active_tags() {
 discover_watchdog_vms() {
         WATCHDOG_VMS=()
         VM_NODE=()
+        VM_TAGS_SNAPSHOT=()
 
         if [[ "$CLUSTER_WIDE" == "1" ]]; then
                 discover_watchdog_vms_cluster
@@ -525,6 +541,7 @@ discover_watchdog_vms_node() {
 
                 if tags_contain_watchdog "$tags"; then
                         WATCHDOG_VMS+=("$vm_id")
+                        VM_TAGS_SNAPSHOT["$vm_id"]="$tags"
                 fi
         done
 
@@ -559,6 +576,7 @@ discover_watchdog_vms_cluster() {
                 if tags_contain_watchdog "$tags"; then
                         WATCHDOG_VMS+=("$vmid")
                         VM_NODE["$vmid"]="$node"
+                        VM_TAGS_SNAPSHOT["$vmid"]="$tags"
                 fi
         done < <(
                 echo "$resources_json" | /usr/bin/jq -r '
