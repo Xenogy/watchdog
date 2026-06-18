@@ -39,7 +39,7 @@ WATCHDOG_ACTIVE_TAG="watchdog-active"
 #                 VM" -- cleaner as a do-not-touch signal for other automation,
 #                 and avoids a tag write per VM per run.
 # Has no effect when WATCHDOG_ACTIVE_TAG is empty.
-TAG_DURING_CHECK=1
+TAG_DURING_CHECK=0
 
 # Optional cluster-wide mode.
 #   0 (default) - only manage VMs on LOCAL_NODE, using local commands exactly as
