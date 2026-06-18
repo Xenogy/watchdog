@@ -53,6 +53,12 @@ SSH_CONNECT_TIMEOUT_SECONDS=10
 
 LOG_FILE="/var/log/vm_monitor.log"
 
+# Root of the Proxmox cluster filesystem (pmxcfs). VM configs live under
+# $PVE_CONF_BASE/nodes/<node>/qemu-server/<vmid>.conf and are replicated to every
+# node, so tags can be read from here directly. You should never need to change
+# this on a real Proxmox host.
+PVE_CONF_BASE="/etc/pve"
+
 # Detection tuning.
 HIGH_CPU_THRESHOLD=99
 LOW_CPU_THRESHOLD=30
@@ -272,11 +278,41 @@ is_monitored_vm() {
 # string may legitimately be empty), and non-zero when the lookup itself failed
 # or timed out. Callers must NOT treat a failed read as "no tags": that would
 # abandon a VM precisely when the node is too busy to answer quickly.
+#
+# Fast path: read the tags straight from the VM's config file. /etc/pve is the
+# pmxcfs cluster filesystem and is replicated to every node, so a VM's config is
+# readable here whether it lives on this node or another -- no SSH, and no pvesh
+# process spawned per VM (that per-call cost dominated discovery and the sweep).
+# The read is still wrapped in run_with_timeout, like every other cluster access,
+# so a wedged pmxcfs cannot hang the run. The awk reads only the main config
+# section (it stops at the first "[snapshot]" header), strips any trailing CR,
+# and prints the tags value; it exits non-zero if it cannot read the file. We
+# trust the fast path only when awk actually read the file (rc 0) AND the file is
+# non-empty -- any other outcome (timeout, read error, truncated/empty file)
+# falls through to the API, and a failed API read returns non-zero ("unknown"),
+# so a failed read is never silently reported as "no tags".
 get_vm_tags() {
         local vm_id="$1"
         local node="${VM_NODE[$vm_id]:-$LOCAL_NODE}"
+        local conf="$PVE_CONF_BASE/nodes/$node/qemu-server/$vm_id.conf"
+        local tags=""
         local raw=""
         local rc=0
+
+        tags=$(run_with_timeout "$PVESH_CMD_TIMEOUT_SECONDS" /usr/bin/awk '
+                /^\[/ { exit }
+                /^tags:[[:space:]]*/ {
+                        sub(/^tags:[[:space:]]*/, "")
+                        sub(/\r$/, "")
+                        print
+                        exit
+                }
+        ' "$conf" 2>/dev/null)
+        rc=$?
+        if (( rc == 0 )) && [[ -s "$conf" ]]; then
+                printf '%s' "$tags"
+                return 0
+        fi
 
         raw=$(run_with_timeout "$PVESH_CMD_TIMEOUT_SECONDS" /usr/bin/pvesh get "/nodes/$node/qemu/$vm_id/config" --output-format json 2>/dev/null)
         rc=$?
