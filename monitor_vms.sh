@@ -750,6 +750,79 @@ clear_vm_lock_if_possible() {
         return 1
 }
 
+# Read the running kvm process PID for a VM from its Proxmox pidfile. Prints the
+# PID (empty when the file is missing/unreadable -- e.g. the VM is not actually
+# running on this node). Read-only; used purely for stop-failure diagnostics.
+get_vm_kvm_pid() {
+        local vm_id="$1"
+        local node="${VM_NODE[$vm_id]:-$LOCAL_NODE}"
+        local pidfile="/run/qemu-server/${vm_id}.pid"
+        local pid=""
+
+        pid=$(run_on_vm_node "$node" "$VM_LOCK_CHECK_TIMEOUT_SECONDS" /bin/cat "$pidfile" 2>/dev/null | awk 'NR==1 {print $1}')
+        if [[ "$pid" =~ ^[0-9]+$ ]]; then
+                printf '%s' "$pid"
+        fi
+}
+
+# Force-stop a VM, capturing qm's exit code and any error text so a failed stop
+# is diagnosable -- the bare command discards both behind >/dev/null, leaving the
+# log unable to say anything beyond "did not stop". Tries --skiplock first and
+# only falls back to a plain stop when that attempt actually failed, mirroring
+# the previous `... --skiplock 1 || qm stop || true` chain. Returns the exit
+# status of the last qm invocation; logs every non-zero result with its output.
+force_stop_vm() {
+        local vm_id="$1"
+        local node="$2"
+        local output=""
+        local rc=0
+
+        output=$(run_on_vm_node "$node" "$QM_ACTION_TIMEOUT_SECONDS" /usr/sbin/qm stop "$vm_id" --skiplock 1 2>&1)
+        rc=$?
+        if (( rc != 0 )); then
+                log "VM $vm_id 'qm stop --skiplock' exited $rc: $(printf '%s' "$output" | tr '\n' ' ')"
+                output=$(run_on_vm_node "$node" "$QM_ACTION_TIMEOUT_SECONDS" /usr/sbin/qm stop "$vm_id" 2>&1)
+                rc=$?
+                if (( rc != 0 )); then
+                        log "VM $vm_id 'qm stop' fallback exited $rc: $(printf '%s' "$output" | tr '\n' ' ')"
+                fi
+        fi
+
+        return "$rc"
+}
+
+# Emit the lock-holder / process-state context the watchdog already gathers, so a
+# "did not stop" line is actionable instead of opaque. It distinguishes the
+# likely causes: a held config lock, a lock holder wedged in uninterruptible (D)
+# I/O sleep, or a live kvm process that ignored the stop (itself possibly in D
+# state). A process in D state cannot be killed until its I/O unblocks, so no
+# amount of retrying qm stop will help -- exactly the case where a manual stop
+# moments later "just works" once the I/O has cleared.
+log_stop_failure_diagnostics() {
+        local vm_id="$1"
+        local node="${VM_NODE[$vm_id]:-$LOCAL_NODE}"
+        local kvm_pid=""
+        local kvm_state=""
+
+        if is_vm_lock_held "$vm_id"; then
+                if is_vm_lock_stuck_in_d_state "$vm_id"; then
+                        log "VM $vm_id stop diagnostics: config lock held by [$(get_vm_lock_holders "$vm_id")] with a holder in uninterruptible D state (I/O wait); cannot be cleared until that I/O completes."
+                else
+                        log "VM $vm_id stop diagnostics: config lock held by [$(get_vm_lock_holders "$vm_id")]."
+                fi
+        else
+                log "VM $vm_id stop diagnostics: no config lock held."
+        fi
+
+        kvm_pid=$(get_vm_kvm_pid "$vm_id")
+        if [[ -n "$kvm_pid" ]]; then
+                kvm_state=$(get_process_state "$node" "$kvm_pid")
+                log "VM $vm_id stop diagnostics: kvm pid $kvm_pid in process state '${kvm_state:-unknown}' (D = uninterruptible I/O wait, unkillable until the I/O completes)."
+        else
+                log "VM $vm_id stop diagnostics: no kvm pidfile found (/run/qemu-server/${vm_id}.pid); VM may have stopped just after the timeout, or is not running on $node."
+        fi
+}
+
 host_has_stuck_vm_tasks() {
         local stuck_count=0
 
@@ -1046,9 +1119,10 @@ restart_vm_core() {
                 if [[ "$status" == "running" ]]; then
                         if [[ "$reason" == "low_cpu_stall" ]] && (( LOW_CPU_FORCE_STOP == 1 )); then
                                 log "VM $vm_id low-CPU restart uses direct force-stop path."
-                                run_on_vm_node "$node" "$QM_ACTION_TIMEOUT_SECONDS" /usr/sbin/qm stop "$vm_id" --skiplock 1 >/dev/null 2>&1 || run_on_vm_node "$node" "$QM_ACTION_TIMEOUT_SECONDS" /usr/sbin/qm stop "$vm_id" >/dev/null 2>&1 || true
+                                force_stop_vm "$vm_id" "$node" || true
                                 if ! wait_for_vm_state "$vm_id" "stopped" "$FORCE_STOP_TIMEOUT_SECONDS"; then
                                         log "VM $vm_id did not stop after direct force-stop."
+                                        log_stop_failure_diagnostics "$vm_id" "$node"
                                         run_on_vm_node "$node" "$QM_ACTION_TIMEOUT_SECONDS" /usr/sbin/qm unlock "$vm_id" >/dev/null 2>&1 || true
                                         ((attempt += 1))
                                         sleep "$RETRY_DELAY_SECONDS"
@@ -1059,9 +1133,10 @@ restart_vm_core() {
 
                                 if ! wait_for_vm_state "$vm_id" "stopped" "$SHUTDOWN_TIMEOUT_SECONDS"; then
                                         log "VM $vm_id graceful shutdown timed out. Forcing stop."
-                                        run_on_vm_node "$node" "$QM_ACTION_TIMEOUT_SECONDS" /usr/sbin/qm stop "$vm_id" --skiplock 1 >/dev/null 2>&1 || run_on_vm_node "$node" "$QM_ACTION_TIMEOUT_SECONDS" /usr/sbin/qm stop "$vm_id" >/dev/null 2>&1 || true
+                                        force_stop_vm "$vm_id" "$node" || true
                                         if ! wait_for_vm_state "$vm_id" "stopped" "$FORCE_STOP_TIMEOUT_SECONDS"; then
                                                 log "VM $vm_id did not stop after force-stop."
+                                                log_stop_failure_diagnostics "$vm_id" "$node"
                                                 run_on_vm_node "$node" "$QM_ACTION_TIMEOUT_SECONDS" /usr/sbin/qm unlock "$vm_id" >/dev/null 2>&1 || true
                                                 ((attempt += 1))
                                                 sleep "$RETRY_DELAY_SECONDS"
