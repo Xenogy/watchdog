@@ -1193,6 +1193,8 @@ restart_vm_core() {
         local attempt=1
         local status=""
         local start_attempted=0
+        local start_output=""
+        local start_rc=0
 
         while (( attempt <= RESTART_RETRIES )); do
                 # Honour a tag removed mid-restart: bail out before escalating
@@ -1262,14 +1264,25 @@ restart_vm_core() {
                 run_on_vm_node "$node" "$QM_ACTION_TIMEOUT_SECONDS" /usr/sbin/qm unlock "$vm_id" >/dev/null 2>&1 || true
                 start_attempted=1
 
-                if run_on_vm_node "$node" "$QM_ACTION_TIMEOUT_SECONDS" /usr/sbin/qm start "$vm_id" >/dev/null 2>&1; then
+                # Capture qm start's exit code and output so a failure is
+                # diagnosable -- the bare command discarded both, leaving the log
+                # unable to say WHY a start failed (storage not activated, missing
+                # volume, config error, ...). rc 124 specifically means the command
+                # hit QM_ACTION_TIMEOUT_SECONDS and was killed by run_with_timeout.
+                start_output=$(run_on_vm_node "$node" "$QM_ACTION_TIMEOUT_SECONDS" /usr/sbin/qm start "$vm_id" 2>&1)
+                start_rc=$?
+                if (( start_rc == 0 )); then
                         if wait_for_vm_state "$vm_id" "running" "$START_TIMEOUT_SECONDS"; then
                                 log "VM $vm_id restarted successfully."
                                 return 0
                         fi
                         log "VM $vm_id start command completed but VM is not running yet."
                 else
-                        log "qm start failed for VM $vm_id (or timed out)."
+                        if (( start_rc == 124 )); then
+                                log "qm start timed out for VM $vm_id after ${QM_ACTION_TIMEOUT_SECONDS}s: $(printf '%s' "$start_output" | tr '\n' ' ')"
+                        else
+                                log "qm start failed for VM $vm_id (exit $start_rc): $(printf '%s' "$start_output" | tr '\n' ' ')"
+                        fi
                         if is_vm_lock_held "$vm_id"; then
                                 log "VM $vm_id start blocked by qemu lock holder."
                                 if ! clear_vm_lock_if_possible "$vm_id"; then
