@@ -191,7 +191,18 @@ run_with_timeout() {
         local child_pid=0
         local deadline=0
 
-        /usr/bin/setsid "$@" &
+        # Run detached in a new session (setsid) so a timeout can SIGKILL the whole
+        # process group, AND with stdin redirected from /dev/null so the wrapped
+        # command is fully non-interactive. The </dev/null is load-bearing for qm:
+        # `qm stop/start/shutdown` fork a task worker, and Proxmox only attempts
+        # terminal job-control (tcsetpgrp) for that worker when stdin is a tty. When
+        # the script is run by hand, stdin is the operator's terminal -- which
+        # setsid has just detached this process from -- so tcsetpgrp fails with
+        # "Inappropriate ioctl for device" and the worker never starts ("got no
+        # worker upid"), breaking the qm action. Forcing stdin to /dev/null makes a
+        # by-hand run behave like cron (where stdin is already /dev/null), so qm
+        # works in both. (This generalises the `ssh -n` in run_on_vm_node.)
+        /usr/bin/setsid "$@" </dev/null &
         child_pid=$!
         deadline=$(( $(date +%s) + timeout_seconds ))
 
