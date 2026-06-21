@@ -4,6 +4,25 @@ set -o pipefail
 
 LOCK_FILE="/var/lock/vm_monitor.lock"
 CRON_LOG_FILE="/var/log/vm-monitor-ex-cron.log"
+
+# Kill switch. If this file exists the watchdog does nothing. Toggle with:
+#   touch <script dir>/watchdog.disabled   # turn the watchdog OFF
+#   rm    <script dir>/watchdog.disabled   # turn it back ON
+# It lives next to this script, so it is easy to find and survives reboots, and
+# is checked both here at startup -- so the next cron tick exits immediately --
+# and between VMs during a run (see watchdog_is_disabled), so disabling also
+# stops a cycle already in progress. SCRIPT_DIR is resolved from the script's
+# real path, so it is correct whether cron runs it by absolute path or you run
+# it by hand from another directory.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+DISABLE_FLAG_FILE="$SCRIPT_DIR/watchdog.disabled"
+if [[ -e "$DISABLE_FLAG_FILE" ]]; then
+        # Stay silent under cron (no tty) so a long pause does not log a line
+        # every interval; a by-hand run (tty on stderr) gets a one-line reason.
+        [[ -t 2 ]] && echo "Watchdog is DISABLED ($DISABLE_FLAG_FILE exists). Remove it to re-enable." >&2
+        exit 0
+fi
+
 if [[ "${VM_MONITOR_SKIP_REDIRECT:-0}" != "1" ]]; then
         exec > >(tee -a "$CRON_LOG_FILE") 2>&1
 fi
@@ -117,6 +136,13 @@ declare -A VM_TAGS_SNAPSHOT=()
 
 log() {
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+# True when the kill-switch flag file is present (watchdog disabled). The same
+# check runs inline at startup (before logging is set up); this helper is for the
+# per-VM loop, so flipping the switch mid-run stops the cycle between VMs.
+watchdog_is_disabled() {
+        [[ -e "$DISABLE_FLAG_FILE" ]]
 }
 
 # Determine the name of the node this script is running on. Proxmox exposes it
@@ -1394,6 +1420,10 @@ cleanup_stale_qm_processes
 clear_stale_active_tags
 
 for VM_ID in "${WATCHDOG_VMS[@]}"; do
+        if watchdog_is_disabled; then
+                log "Watchdog disabled mid-run ($DISABLE_FLAG_FILE present); stopping this cycle."
+                break
+        fi
         reap_finished_restarts
         log "Checking VM: $VM_ID"
 

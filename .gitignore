@@ -1,0 +1,3 @@
+# Local kill-switch flag, created by `touch watchdog.disabled` to pause the
+# watchdog and removed to resume it. Machine-local state, never committed.
+watchdog.disabled

@@ -244,6 +244,29 @@ crontab -l
 
 That's it — the watchdog now checks your VMs four times an hour.
 
+## Pause / disable the watchdog
+
+You don't need to touch cron to turn the watchdog off. Drop a flag file next to
+the script and it stops; remove it and it resumes:
+
+```bash
+touch /root/watchdog/watchdog.disabled   # OFF — pause the watchdog
+rm    /root/watchdog/watchdog.disabled   # ON  — resume it
+```
+
+- **Takes effect immediately.** With the flag present, the next cron run exits
+  right away without touching any VM. If a run is already in progress, it stops
+  cleanly after the VM it's on (never mid-restart).
+- **Survives reboots.** The flag lives next to the script, so an OFF watchdog
+  stays off until you remove the file.
+- **Quiet.** A disabled cron run logs nothing (so a long pause won't fill the
+  log). Running `./monitor_vms.sh` by hand while disabled prints a one-line
+  reminder telling you the flag is set.
+
+This is the recommended way to pause for maintenance — commenting out the cron
+entry can still let an already-scheduled run fire, whereas the flag is checked at
+the start of (and during) every run.
+
 ## Logs
 
 The watchdog records everything it does in two files:
