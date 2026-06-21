@@ -61,6 +61,16 @@ MAX_PARALLEL_RESTARTS=1
 RESTART_COOLDOWN_SECONDS=1800
 RESTART_STATE_DIR="/run/vm_monitor"
 
+# Direct-kill fallback. When `qm stop` cannot run its task worker (headless
+# worker-fork failures that log "got no worker upid"/"failed to tcsetpgrp"), the
+# VM is never actually told to stop even though its kvm process is alive and
+# signalable. As a last resort, signal the kvm process from its pidfile directly
+# -- SIGTERM first (a stalled qemu may ignore it), then SIGKILL -- which needs no
+# task worker and no terminal. Set DIRECT_KILL_ENABLED=0 to disable.
+DIRECT_KILL_ENABLED=1
+DIRECT_KILL_TERM_WAIT_SECONDS=8
+DIRECT_KILL_KILL_WAIT_SECONDS=15
+
 # Command hard timeouts to avoid indefinite hangs.
 QM_STATUS_TIMEOUT_SECONDS=8
 QM_ACTION_TIMEOUT_SECONDS=60
@@ -823,6 +833,63 @@ log_stop_failure_diagnostics() {
         fi
 }
 
+# Direct, qm-independent force stop: signal the VM's kvm process straight from its
+# pidfile. Used as a fallback when `qm stop` cannot run its task worker (e.g. the
+# headless worker-fork failure that logs "got no worker upid" -- the kvm process
+# itself is still a normal, signalable process). SIGTERM first, then SIGKILL.
+# Refuses to act unless the pid is alive, not wedged in uninterruptible D state (a
+# signal cannot reap it), and its command line still belongs to this VM (guards
+# against signalling a recycled pid). Returns 0 only once the VM is confirmed
+# stopped; 1 (no-op or still running) otherwise.
+force_kill_vm_process() {
+        local vm_id="$1"
+        local node="${VM_NODE[$vm_id]:-$LOCAL_NODE}"
+        local pid=""
+        local state=""
+        local args=""
+
+        if (( DIRECT_KILL_ENABLED != 1 )); then
+                return 1
+        fi
+
+        pid=$(get_vm_kvm_pid "$vm_id")
+        if [[ -z "$pid" ]]; then
+                log "VM $vm_id direct-kill: no kvm pidfile found; nothing to signal (already stopped, or not running on $node)."
+                return 1
+        fi
+
+        state=$(get_process_state "$node" "$pid")
+        if [[ "$state" == "D" ]]; then
+                log "VM $vm_id direct-kill: kvm pid $pid is in uninterruptible D state; a signal cannot reap it until its I/O completes. Skipping."
+                return 1
+        fi
+
+        # Confirm the pid is still this VM's kvm process before signalling it. The
+        # kvm command line carries both `-id <vmid>` and the pidfile path, so a
+        # recycled pid (a different process that inherited the number) won't match.
+        args=$(run_on_vm_node "$node" "$VM_LOCK_CHECK_TIMEOUT_SECONDS" /usr/bin/ps -o args= -p "$pid" 2>/dev/null)
+        if [[ "$args" != *"/$vm_id.pid"* && "$args" != *" -id $vm_id"* ]]; then
+                log "VM $vm_id direct-kill: pid $pid does not look like this VM's kvm process (args: ${args:-<unreadable>}); refusing to kill."
+                return 1
+        fi
+
+        log "VM $vm_id direct-kill: escalating to signal kvm pid $pid (qm stop could not run its task worker)."
+        run_on_vm_node "$node" "$QM_ACTION_TIMEOUT_SECONDS" /bin/kill -TERM "$pid" >/dev/null 2>&1 || true
+        if wait_for_vm_state "$vm_id" "stopped" "$DIRECT_KILL_TERM_WAIT_SECONDS"; then
+                log "VM $vm_id stopped after SIGTERM to kvm pid $pid."
+                return 0
+        fi
+
+        run_on_vm_node "$node" "$QM_ACTION_TIMEOUT_SECONDS" /bin/kill -KILL "$pid" >/dev/null 2>&1 || true
+        if wait_for_vm_state "$vm_id" "stopped" "$DIRECT_KILL_KILL_WAIT_SECONDS"; then
+                log "VM $vm_id stopped after SIGKILL to kvm pid $pid."
+                return 0
+        fi
+
+        log "VM $vm_id direct-kill: still not stopped after SIGKILL to kvm pid $pid."
+        return 1
+}
+
 host_has_stuck_vm_tasks() {
         local stuck_count=0
 
@@ -1123,10 +1190,12 @@ restart_vm_core() {
                                 if ! wait_for_vm_state "$vm_id" "stopped" "$FORCE_STOP_TIMEOUT_SECONDS"; then
                                         log "VM $vm_id did not stop after direct force-stop."
                                         log_stop_failure_diagnostics "$vm_id" "$node"
-                                        run_on_vm_node "$node" "$QM_ACTION_TIMEOUT_SECONDS" /usr/sbin/qm unlock "$vm_id" >/dev/null 2>&1 || true
-                                        ((attempt += 1))
-                                        sleep "$RETRY_DELAY_SECONDS"
-                                        continue
+                                        if ! force_kill_vm_process "$vm_id" "$node"; then
+                                                run_on_vm_node "$node" "$QM_ACTION_TIMEOUT_SECONDS" /usr/sbin/qm unlock "$vm_id" >/dev/null 2>&1 || true
+                                                ((attempt += 1))
+                                                sleep "$RETRY_DELAY_SECONDS"
+                                                continue
+                                        fi
                                 fi
                         else
                                 run_on_vm_node "$node" "$QM_ACTION_TIMEOUT_SECONDS" /usr/sbin/qm shutdown "$vm_id" --timeout "$SHUTDOWN_TIMEOUT_SECONDS" >/dev/null 2>&1 || true
@@ -1137,10 +1206,12 @@ restart_vm_core() {
                                         if ! wait_for_vm_state "$vm_id" "stopped" "$FORCE_STOP_TIMEOUT_SECONDS"; then
                                                 log "VM $vm_id did not stop after force-stop."
                                                 log_stop_failure_diagnostics "$vm_id" "$node"
-                                                run_on_vm_node "$node" "$QM_ACTION_TIMEOUT_SECONDS" /usr/sbin/qm unlock "$vm_id" >/dev/null 2>&1 || true
-                                                ((attempt += 1))
-                                                sleep "$RETRY_DELAY_SECONDS"
-                                                continue
+                                                if ! force_kill_vm_process "$vm_id" "$node"; then
+                                                        run_on_vm_node "$node" "$QM_ACTION_TIMEOUT_SECONDS" /usr/sbin/qm unlock "$vm_id" >/dev/null 2>&1 || true
+                                                        ((attempt += 1))
+                                                        sleep "$RETRY_DELAY_SECONDS"
+                                                        continue
+                                                fi
                                         fi
                                 fi
                         fi
