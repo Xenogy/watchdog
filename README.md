@@ -84,12 +84,7 @@ tags you must list them all (semicolon-separated), e.g.:
 qm set 101 --tags "production;web;watchdog"
 ```
 
-To **temporarily disable** monitoring for a VM — handy during testing — just
-remove the `watchdog` tag again (UI, or re-run `qm set` with the remaining tags;
-`qm set <vmid> --tags ""` clears all tags). The change takes effect on the next
-run. The script also re-checks each VM's tags immediately before acting on it,
-so a tag removed mid-run is honored before the next restart attempt — though it
-won't interrupt a `qm` stop/start already in progress.
+To **temporarily disable** monitoring for a VM, just remove the `watchdog` tag again
 
 Notes:
 
